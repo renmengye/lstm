@@ -15,6 +15,9 @@ function g_disable_dropout(node)
   end
   if string.match(node.__typename, "Dropout") then
     node.train = false
+  elseif string.match(node.__typename, "BatchNormalization") then
+      --print("Disabled BN train")
+      node.train = false
   end
 end
 
@@ -27,6 +30,9 @@ function g_enable_dropout(node)
   end
   if string.match(node.__typename, "Dropout") then
     node.train = true
+  elseif string.match(node.__typename, "BatchNormalization") then
+      --print("Enabled BN train")
+      node.train = true
   end
 end
 
@@ -42,9 +48,15 @@ function g_cloneManyTimes(net, T)
     local clone = reader:readObject()
     reader:close()
     local cloneParams, cloneGradParams = clone:parameters()
+    -- print(#params)
     for i = 1, #params do
-      cloneParams[i]:set(params[i])
-      cloneGradParams[i]:set(gradParams[i])
+      -- print(i .. ", " .. tostring(params[i]:size()))
+      --if #params == 19 and (i==4 or i==5 or i==8 or i==9 or i==12 or i==13 or i==16 or i==17) then
+      --    print("Ignoring parameters")
+      --else
+          cloneParams[i]:set(params[i])
+          cloneGradParams[i]:set(gradParams[i])
+      --end
     end
     clones[t] = clone
     collectgarbage()

@@ -31,13 +31,14 @@ cmd:text()
 cmd:text('PTB benchmark')
 cmd:text()
 cmd:text('Options')
-cmd:option('--model',   'small',   'small/medium/large')
-cmd:option('--bn',      false,     'use recurrent BN')
-cmd:option('--bn_all',  false,     'use recurrent BN on all three spots')
-cmd:option('--ln',      false,     'use LN')
-cmd:option('--ln_all',  false,     'use LN on all three spots')
-cmd:option('--affine',  false,     'add affined transformation in BN/LN')
-cmd:option('--eps',     1e-3,      'epsilon value in BN/LN')
+cmd:option('--model',     'small',   'small/medium/large')
+cmd:option('--bn',        false,     'use recurrent BN')
+cmd:option('--bn_all',    false,     'use recurrent BN on all three spots')
+cmd:option('--ln',        false,     'use LN')
+cmd:option('--ln_all',    false,     'use LN on all three spots')
+cmd:option('--affine',    false,     'add affined transformation in BN/LN')
+cmd:option('--eps',       1e-3,      'epsilon value in BN/LN')
+cmd:option('--basic_rnn', false,     'use vanilla RNN') 
 cmd:text()
 
 -- parse input params
@@ -75,6 +76,21 @@ elseif cmd_params.model == 'medium' then
         vocab_size=10000,
         max_epoch=6,
         max_max_epoch=39,
+        max_grad_norm=5
+    }
+elseif cmd_params.model == 'small' and cmd_params.basic_rnn then
+    params = {
+        batch_size=20,
+        seq_length=20,
+        layers=2,
+        decay=2,
+        rnn_size=400,
+        dropout=0,
+        init_weight=0.1,
+        lr=0.1,
+        vocab_size=10000,
+        max_epoch=4,
+        max_max_epoch=13,
         max_grad_norm=5
     }
 elseif cmd_params.model == 'small' then
@@ -118,6 +134,7 @@ params.layer_norm_all = cmd_params.ln_all
 params.momentum       = 0.1
 params.eps            = cmd_params.eps
 params.affine         = cmd_params.affine
+params.basic_rnn      = cmd_params.basic_rnn
 
 print(params)
 
@@ -175,21 +192,15 @@ function create_or_share(module_type, name, module_dict, args)
             print('Create ' .. name)
         end
     elseif module_type == 'BatchNormalization' then
-        --if module_dict[name] then
-            --result = nn.BatchNormalization(unpack(args)):cuda()
-            --result:share(module_dict[name], 'weight', 'gradWeight', 'bias', 'gradBias')
-            --print('Share ' .. name)
-        --else
-            result = nn.BatchNormalization(unpack(args)):cuda()
-        --    module_dict[name] = result
-            if result.bias then
-                result.bias:zero()
-            end
-            if result.weight then
-                result.weight = result.weight:zero() + 1
-            end
-            print('Create ' .. name)
-        --end
+        -- Always create BN instead of reusing.
+        result = nn.BatchNormalization(unpack(args)):cuda()
+        if result.bias then
+            result.bias:zero()
+        end
+        if result.weight then
+            result.weight = result.weight:zero() + 1
+        end
+        print('Create ' .. name)
     else
         error(string.format('Unsupported module type: %s', module_type))
     end
@@ -197,6 +208,46 @@ function create_or_share(module_type, name, module_dict, args)
 end
 
 local module_dict = {}
+
+local function vanilla_rnn(x, prev_h, layer_idx)
+    print('Vanilla RNN unroll')
+    -- Calculate all four gates in one go
+    local i2h              = create_or_share('Linear', 'i2h_' .. layer_idx,
+                                               module_dict, 
+                                               {params.rnn_size, params.rnn_size})(x)
+    local h2h              = create_or_share('Linear', 'h2h_' .. layer_idx,
+                                               module_dict,
+                                               {params.rnn_size, params.rnn_size})(
+                                               prev_h)
+    if params.batch_norm then
+        local eps          = params.eps
+        local dim          = params.rnn_size
+        local mom          = params.momentum
+        local aff          = params.affine
+        --local bni        = nn.BatchNormalization(dim, eps, mom, aff)
+        --local bnh        = nn.BatchNormalization(dim, eps, mom, aff)
+        local bni          = create_or_share('BatchNormalization', 'bni_' .. layer_idx,
+                                             module_dict, {dim, eps, mom, aff})
+        local bnh          = create_or_share('BatchNormalization', 'bnh_' .. layer_idx,
+                                             module_dict, {dim, eps, mom, aff})
+        i2h                = bni(i2h)
+        h2h                = bnh(h2h)
+    elseif params.layer_norm then
+        local eps          = params.eps
+        local dim          = params.rnn_size
+        local aff          = params.affine
+        local lni          = create_or_share('LayerNormalization', 'lni_' .. layer_idx, 
+                                             module_dict, {dim, 0, eps, aff})
+        local lnh          = create_or_share('LayerNormalization', 'lnh_' .. layer_idx, 
+                                             module_dict, {dim, 0, eps, aff})
+        i2h                = lni(i2h)
+        h2h                = lnh(h2h)
+         
+    end
+    local next_h           = nn.Tanh()(nn.CAddTable()({i2h, h2h}))
+    return next_h
+end
+
 
 local function lstm(x, prev_c, prev_h, layer_idx)
     -- Calculate all four gates in one go
@@ -285,21 +336,38 @@ local function create_network()
     local i                = {[0] = word_embed(x)}
     word_embed.weight:uniform(-params.init_weight, params.init_weight)
     local next_s           = {}
-    local split            = {prev_s:split(2 * params.layers)}
+    local split
+    if params.basic_rnn then
+        split              = {prev_s:split(params.layers)}
+    else
+        split              = {prev_s:split(2 * params.layers)}
+    end
     for layer_idx = 1, params.layers do
-        local prev_c         = split[2 * layer_idx - 1]
-        local prev_h         = split[2 * layer_idx]
-        local dropped        = nn.Dropout(params.dropout)(i[layer_idx - 1])
-        local next_c, next_h = lstm(dropped, prev_c, prev_h, layer_idx)
-        table.insert(next_s, next_c)
-        table.insert(next_s, next_h)
-        i[layer_idx] = next_h
+        if params.basic_rnn then
+            local prev_h         = split[layer_idx]
+            local dropped        = nn.Dropout(params.dropout)(i[layer_idx - 1])
+            -- print('Dropped')
+            -- print(dropped)
+            local next_h         = vanilla_rnn(dropped, prev_h, layer_idx)
+            table.insert(next_s, next_h)
+            i[layer_idx] = next_h
+        else
+            local prev_c         = split[2 * layer_idx - 1]
+            local prev_h         = split[2 * layer_idx]
+            local dropped        = nn.Dropout(params.dropout)(i[layer_idx - 1])
+            local next_c, next_h = lstm(dropped, prev_c, prev_h, layer_idx)
+            table.insert(next_s, next_c)
+            table.insert(next_s, next_h)
+            i[layer_idx] = next_h
+        end 
     end
     --local h2y              = nn.Linear(params.rnn_size, params.vocab_size)
     local h2y              = create_or_share('Linear', 'h2y', module_dict,
                                              {params.rnn_size, params.vocab_size})
     h2y.weight:uniform(-params.init_weight, params.init_weight)
     h2y.bias:zero()
+    -- print('haha')
+    -- print(i[params.layers])
     local dropped          = nn.Dropout(params.dropout)(i[params.layers])
     local pred             = nn.LogSoftMax()(h2y(dropped))
     local err              = nn.ClassNLLCriterion()({pred, y})
@@ -319,13 +387,26 @@ local function setup()
     model.start_s = {}
     for j = 0, params.seq_length do
         model.s[j] = {}
-        for d = 1, 2 * params.layers do
-            model.s[j][d] = transfer_data(torch.zeros(params.batch_size, params.rnn_size))
+        if params.basic_rnn then
+            for d = 1, params.layers do
+                model.s[j][d] = transfer_data(torch.zeros(params.batch_size, params.rnn_size))
+            end
+        else
+            for d = 1, 2 * params.layers do
+                model.s[j][d] = transfer_data(torch.zeros(params.batch_size, params.rnn_size))
+            end
         end
     end
-    for d = 1, 2 * params.layers do
-        model.start_s[d] = transfer_data(torch.zeros(params.batch_size, params.rnn_size))
-        model.ds[d] = transfer_data(torch.zeros(params.batch_size, params.rnn_size))
+    if params.basic_rnn then
+        for d = 1, params.layers do
+            model.start_s[d] = transfer_data(torch.zeros(params.batch_size, params.rnn_size))
+            model.ds[d] = transfer_data(torch.zeros(params.batch_size, params.rnn_size))
+        end
+    else
+        for d = 1, 2 * params.layers do
+            model.start_s[d] = transfer_data(torch.zeros(params.batch_size, params.rnn_size))
+            model.ds[d] = transfer_data(torch.zeros(params.batch_size, params.rnn_size))
+        end
     end
     model.core_network = core_network
     
@@ -340,11 +421,60 @@ local function setup()
     --model.rnns:cuda()
 end
 
+local function save_csv(fn, tensor)
+    print('Writing to '..fn)
+    local f = io.open(fn, "w")
+    local sz = tensor:size()
+    if #sz == 1 then
+        for jj = 1, sz[1] do
+            if jj > 1 then
+                f:write(",")
+            end
+            f:write(string.format("%.7f", tensor[jj]))
+        end
+    elseif #sz == 2 then
+        for ii = 1, sz[1] do
+            for jj = 1, sz[2] do
+                if jj > 1 then
+                    f:write(",")
+                end
+                f:write(string.format("%.7f", tensor[ii][jj]))
+            end
+            f:write("\n")
+        end
+    else
+        print("Tensor size not supported.")
+    end
+    f:close()
+end
+
+local function save(folder)
+    print(module_dict)
+    print('Serializing the model into CSV format...')
+    save_csv(folder.."word_embed.csv", module_dict.word_embed.weight)
+    save_csv(folder.."i2h1_w.csv",     module_dict.i2h_1.weight)
+    save_csv(folder.."i2h1_b.csv",     module_dict.i2h_1.bias)
+    save_csv(folder.."i2h2_w.csv",     module_dict.i2h_2.weight)
+    save_csv(folder.."i2h2_b.csv",     module_dict.i2h_2.bias)
+    save_csv(folder.."h2h1_w.csv",     module_dict.h2h_1.weight)
+    save_csv(folder.."h2h1_b.csv",     module_dict.h2h_1.bias)
+    save_csv(folder.."h2h2_w.csv",     module_dict.h2h_2.weight)
+    save_csv(folder.."h2h2_b.csv",     module_dict.h2h_2.bias)
+    save_csv(folder.."h2y_w.csv",      module_dict.h2y.weight)
+    save_csv(folder.."h2y_b.csv",      module_dict.h2y.bias)
+end
+
 local function reset_state(state)
     state.pos = 1
     if model ~= nil and model.start_s ~= nil then
-        for d = 1, 2 * params.layers do
-            model.start_s[d]:zero()
+        if params.basic_rnn then
+            for d = 1, params.layers do
+                model.start_s[d]:zero()
+            end
+        else
+            for d = 1, 2 * params.layers do
+                model.start_s[d]:zero()
+            end
         end
     end
 end
@@ -450,6 +580,7 @@ local function main()
     local perps
     
     local logs_folder = "/u/mren/public_html/results/"
+    local save_folder = "/ais/gobi4/mren/results/div_norm/"
     local exp_id = nil
     local desc = nil
     if params.batch_norm then
@@ -465,12 +596,17 @@ local function main()
     print("Experiment ID "..exp_id)
    
     -- Register logs
-    local catalog_fn     = logs_folder.."catalog"
-    local exp_folder     = logs_folder .. exp_id .. "/"
-    local catalog_fn_exp = exp_folder .. "catalog"
+    local catalog_fn      = logs_folder.."catalog"
+    local exp_folder      = logs_folder .. exp_id .. "/"
+    local catalog_fn_exp  = exp_folder .. "catalog"
+    local exp_save_folder = save_folder .. exp_id .. "/"
     
     io.open(catalog_fn, "a"):write(exp_id..","..desc.."\n")
     os.execute("mkdir " .. exp_folder)
+    os.execute("mkdir " .. exp_save_folder)
+
+    -- Save initial weights
+    -- save(exp_save_folder)
 
     local catalog_file = io.open(catalog_fn_exp, "w")
     catalog_file:write("filename,type,name\n")
@@ -491,6 +627,7 @@ local function main()
 
     while epoch < params.max_max_epoch do
         local perp = fp(state_train)
+        -- print('Hello')
         if perps == nil then
             perps = torch.zeros(epoch_size):add(perp)
         end
@@ -530,6 +667,9 @@ local function main()
     test_perp = run_test()
     io.open(test_ppl_fn, "a"):write(step..","..os.time()..","..test_perp.."\n")
     print("Training is over.")
+
+    -- Save final weights
+    -- save(exp_save_folder)
 end
 
 main()
